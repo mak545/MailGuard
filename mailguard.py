@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Email Security Scanner - Comprehensive Email Security Vulnerability Scanner
-Author: Security Research Team
+MailGuard - Comprehensive Email Security Vulnerability Scanner
+Author: Mohamed Essam
 License: MIT
 Description: Scans MX, SPF, DKIM, and DMARC records for security vulnerabilities
 """
