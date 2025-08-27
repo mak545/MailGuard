@@ -1,0 +1,6 @@
+aiohttp>=3.8.0
+asyncio-timeout>=4.0.0
+dnspython>=2.3.0
+python-whois>=0.8.0
+tqdm>=4.64.0
+requests>=2.28.0
