@@ -16,12 +16,11 @@ import time
 import re
 import base64
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any, Set
+from typing import List, Dict, Optional, Tuple, Any
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 import logging
 from urllib.parse import urlencode
-import socket
 import whois
 import dns.resolver
 import dns.exception
@@ -29,7 +28,6 @@ from concurrent.futures import ThreadPoolExecutor
 import ssl
 import warnings
 from tqdm import tqdm
-import requests
 
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -104,7 +102,7 @@ class EmailSecurityResult:
 class EmailSecurityScanner:
     """Professional Email Security Scanner with comprehensive checks"""
     
-    # Multiple DNS resolvers for redundancy
+    # many DNS resolvers for redundancy
     DNS_RESOLVERS = [
         "8.8.8.8",      # Google
         "1.1.1.1",      # Cloudflare
@@ -232,7 +230,7 @@ class EmailSecurityScanner:
                         
                         if 'Answer' in data:
                             for answer in data['Answer']:
-                                if answer.get('type') == 15:#type 
+                                if answer.get('type') == 15: 
                                     mx_data = answer['data'].split(' ', 1)
                                     if len(mx_data) == 2:
                                         priority, hostname = mx_data
@@ -603,7 +601,7 @@ class EmailSecurityScanner:
             dmarc_record.has_ruf = True
         
         # Determine vulnerability status
-        if dmarc_record.policy == 'none':
+        if dmarc_record.policy == 'none' and dmarc_record.percentage > 0:
             status = VulnerabilityStatus.WEAK
             message = "DMARC policy is 'none' - provides no protection"
         elif dmarc_record.policy in ['quarantine', 'reject']:
