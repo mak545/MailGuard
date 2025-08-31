@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-MailGuard - Comprehensive Email Security Vulnerability Scanner
+MailGuard - Comprehensive Email Security Vulnerability Scanner with DNS Caching
 Author: Mohamed Essam
 License: MIT
 Description: Scans MX, SPF, DKIM, and DMARC records for security vulnerabilities
+Enhanced with DNS response caching for improved performance
 """
 
 import asyncio
@@ -15,8 +16,9 @@ import sys
 import time
 import re
 import base64
+import hashlib
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, NamedTuple
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 import logging
@@ -39,6 +41,89 @@ class VulnerabilityStatus(Enum):
     ERROR = "ERROR"
     TIMEOUT = "TIMEOUT"
     MISSING = "MISSING"
+
+class DNSCacheEntry(NamedTuple):
+    """DNS cache entry with timestamp and TTL"""
+    data: Any
+    timestamp: float
+    ttl: int
+    query_type: str
+
+@dataclass
+class DNSCache:
+    """DNS response caching system"""
+    def __init__(self, max_size: int = 10000, default_ttl: int = 300):
+        self.cache: Dict[str, DNSCacheEntry] = {}
+        self.max_size = max_size
+        self.default_ttl = default_ttl
+        self.hits = 0
+        self.misses = 0
+        self.lock = asyncio.Lock()
+    
+    def _make_cache_key(self, domain: str, record_type: str, resolver: str = "") -> str:
+        """Create a unique cache key for DNS queries"""
+        key_data = f"{domain.lower()}:{record_type.upper()}:{resolver}"
+        return hashlib.md5(key_data.encode()).hexdigest()
+    
+    async def get(self, domain: str, record_type: str, resolver: str = "") -> Optional[Any]:
+        """Get cached DNS response if valid"""
+        async with self.lock:
+            cache_key = self._make_cache_key(domain, record_type, resolver)
+            
+            if cache_key in self.cache:
+                entry = self.cache[cache_key]
+                current_time = time.time()
+                
+                # Check if entry is still valid
+                if current_time - entry.timestamp < entry.ttl:
+                    self.hits += 1
+                    return entry.data
+                else:
+                    # Entry expired, remove it
+                    del self.cache[cache_key]
+            
+            self.misses += 1
+            return None
+    
+    async def set(self, domain: str, record_type: str, data: Any, ttl: int = None, resolver: str = "") -> None:
+        """Cache DNS response"""
+        async with self.lock:
+            cache_key = self._make_cache_key(domain, record_type, resolver)
+            
+            
+            if len(self.cache) >= self.max_size:
+                
+                oldest_keys = list(self.cache.keys())[:self.max_size // 4]
+                for key in oldest_keys:
+                    del self.cache[key]
+            
+            self.cache[cache_key] = DNSCacheEntry(
+                data=data,
+                timestamp=time.time(),
+                ttl=ttl or self.default_ttl,
+                query_type=record_type
+            )
+    
+    async def clear(self) -> None:
+        """Clear all cache entries"""
+        async with self.lock:
+            self.cache.clear()
+            self.hits = 0
+            self.misses = 0
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics"""
+        total_requests = self.hits + self.misses
+        hit_rate = (self.hits / total_requests * 100) if total_requests > 0 else 0
+        
+        return {
+            "cache_size": len(self.cache),
+            "max_size": self.max_size,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": round(hit_rate, 2),
+            "total_requests": total_requests
+        }
 
 @dataclass
 class MXRecord:
@@ -76,7 +161,6 @@ class DMARCRecord:
 class EmailSecurityResult:
     domain: str
     
-    
     mx_status: VulnerabilityStatus = VulnerabilityStatus.ERROR
     mx_records: List[MXRecord] = field(default_factory=list)
     vulnerable_mx: List[str] = field(default_factory=list)
@@ -85,12 +169,10 @@ class EmailSecurityResult:
     spf_status: VulnerabilityStatus = VulnerabilityStatus.ERROR
     spf_record: Optional[SPFRecord] = None
     spf_message: str = ""
-    
 
     dkim_status: VulnerabilityStatus = VulnerabilityStatus.ERROR
     dkim_records: List[DKIMRecord] = field(default_factory=list)
     dkim_message: str = ""
-    
 
     dmarc_status: VulnerabilityStatus = VulnerabilityStatus.ERROR
     dmarc_record: Optional[DMARCRecord] = None
@@ -98,11 +180,12 @@ class EmailSecurityResult:
     
     scan_time: float = 0.0
     details: Dict[str, Any] = field(default_factory=dict)
+    cache_stats: Dict[str, Any] = field(default_factory=dict)
 
 class EmailSecurityScanner:
-    """Professional Email Security Scanner with comprehensive checks"""
+    """Professional Email Security Scanner with comprehensive checks and DNS caching"""
     
-    # many DNS resolvers for redundancy
+    # DNS resolvers for redundancy
     DNS_RESOLVERS = [
         "8.8.8.8",      # Google
         "1.1.1.1",      # Cloudflare
@@ -111,7 +194,7 @@ class EmailSecurityScanner:
         "8.26.56.26",   # Comodo
     ]
     
-    # DNS-over-HTTPS
+    # DNS-over-HTTPS endpoints
     DOH_ENDPOINTS = [
         "https://dns.google/resolve",
         "https://cloudflare-dns.com/dns-query",
@@ -121,13 +204,18 @@ class EmailSecurityScanner:
     # Common DKIM selectors to try
     DEFAULT_DKIM_SELECTORS = ['default', 'mail', 'k1', 'google', 'selector1', 'selector2', 'dkim']
     
-    def __init__(self, concurrency: int = 50, timeout: int = 10, verbose: bool = False):
+    def __init__(self, concurrency: int = 50, timeout: int = 10, verbose: bool = False, 
+                 enable_cache: bool = True, cache_ttl: int = 300, cache_size: int = 10000):
         self.concurrency = concurrency
         self.timeout = timeout
         self.verbose = verbose
         self.session: Optional[aiohttp.ClientSession] = None
         self.logger = self._setup_logger()
         self.executor = ThreadPoolExecutor(max_workers=concurrency)
+        
+        # DNS caching
+        self.enable_cache = enable_cache
+        self.dns_cache = DNSCache(max_size=cache_size, default_ttl=cache_ttl) if enable_cache else None
         
     def _setup_logger(self) -> logging.Logger:
         """Setup logging configuration"""
@@ -156,7 +244,7 @@ class EmailSecurityScanner:
         self.session = aiohttp.ClientSession(
             connector=connector, 
             timeout=timeout,
-            headers={'User-Agent': 'EmailSec-Scanner/2.0'}
+            headers={'User-Agent': 'EmailSec-Scanner/2.0-Cached'}
         )
         return self
         
@@ -173,7 +261,16 @@ class EmailSecurityScanner:
             self.logger.debug(f"{prefix}{message}")
             
     async def _get_mx_records_dns(self, domain: str) -> List[MXRecord]:
-        """Get MX records using multiple DNS resolvers - aggregate all results"""
+        """Get MX records using multiple DNS resolvers with caching"""
+        cache_key = f"mx:{domain}"
+        
+        # Check cache first
+        if self.dns_cache:
+            cached_result = await self.dns_cache.get(domain, "MX")
+            if cached_result is not None:
+                self._log_verbose(f"Using cached MX records", domain)
+                return cached_result
+        
         all_mx_records = {}
         
         for resolver_ip in self.DNS_RESOLVERS:
@@ -201,13 +298,26 @@ class EmailSecurityScanner:
             except (dns.exception.DNSException, Exception) as e:
                 self._log_verbose(f"DNS resolver {resolver_ip} failed: {str(e)}", domain)
                 continue
-                
-        return list(all_mx_records.values())
+        
+        result = list(all_mx_records.values())
+        
+        # Cache the result
+        if self.dns_cache and result:
+            await self.dns_cache.set(domain, "MX", result, ttl=600)  # Cache MX records for 10 minutes
+            
+        return result
         
     async def _get_mx_records_doh(self, domain: str) -> List[MXRecord]:
-        """Get MX records using DNS-over-HTTPS for verification"""
+        """Get MX records using DNS-over-HTTPS with caching"""
         if not self.session:
             return []
+        
+        # Check cache first
+        if self.dns_cache:
+            cached_result = await self.dns_cache.get(domain, "MX_DOH")
+            if cached_result is not None:
+                self._log_verbose(f"Using cached DoH MX records", domain)
+                return cached_result
             
         all_mx_records = {}
         
@@ -243,11 +353,24 @@ class EmailSecurityScanner:
             except Exception as e:
                 self._log_verbose(f"DoH query failed for {doh_url}: {str(e)}", domain)
                 continue
-                
-        return list(all_mx_records.values())
+        
+        result = list(all_mx_records.values())
+        
+        # Cache the result
+        if self.dns_cache and result:
+            await self.dns_cache.set(domain, "MX_DOH", result, ttl=600)
+            
+        return result
         
     async def _get_txt_records(self, domain: str, record_type: str = "TXT") -> List[str]:
-        """Get TXT records using multiple DNS resolvers"""
+        """Get TXT records using multiple DNS resolvers with caching"""
+        # Check cache first
+        if self.dns_cache:
+            cached_result = await self.dns_cache.get(domain, record_type)
+            if cached_result is not None:
+                self._log_verbose(f"Using cached {record_type} records", domain)
+                return cached_result
+        
         all_txt_records = set()
         
         for resolver_ip in self.DNS_RESOLVERS:
@@ -266,7 +389,7 @@ class EmailSecurityScanner:
                 )
                 
                 for rdata in answers:
-                    # Join
+                    # Join multiple strings in TXT record
                     txt_data = ''.join([s.decode() if isinstance(s, bytes) else str(s) for s in rdata.strings])
                     all_txt_records.add(txt_data)
                 
@@ -275,11 +398,27 @@ class EmailSecurityScanner:
             except (dns.exception.DNSException, Exception) as e:
                 self._log_verbose(f"DNS resolver {resolver_ip} failed for {record_type}: {str(e)}", domain)
                 continue
-                
-        return list(all_txt_records)
+        
+        result = list(all_txt_records)
+        
+        # Cache the result - use shorter TTL for TXT records as they change more frequently
+        if self.dns_cache and result:
+            txt_ttl = 300 if record_type == "TXT" else 600  # 5 min for TXT, 10 min for others
+            await self.dns_cache.set(domain, record_type, result, ttl=txt_ttl)
+            
+        return result
         
     async def _resolve_hostname(self, hostname: str) -> bool:
-        """Check if hostname resolves to valid IP addresses"""
+        """Check if hostname resolves to valid IP addresses with caching"""
+        # Check cache first
+        if self.dns_cache:
+            cached_result = await self.dns_cache.get(hostname, "RESOLVE")
+            if cached_result is not None:
+                self._log_verbose(f"Using cached hostname resolution", hostname)
+                return cached_result
+        
+        resolves = False
+        
         for resolver_ip in self.DNS_RESOLVERS[:2]:
             try:
                 resolver = dns.resolver.Resolver()
@@ -288,33 +427,46 @@ class EmailSecurityScanner:
                 
                 loop = asyncio.get_event_loop()
                 
-                
+                # Try A record
                 try:
                     await loop.run_in_executor(
                         self.executor,
                         lambda: resolver.resolve(hostname, 'A')
                     )
-                    return True
+                    resolves = True
+                    break
                 except dns.exception.DNSException:
                     pass
                     
-            
+                # Try AAAA record
                 try:
                     await loop.run_in_executor(
                         self.executor,
                         lambda: resolver.resolve(hostname, 'AAAA')
                     )
-                    return True
+                    resolves = True
+                    break
                 except dns.exception.DNSException:
                     pass
                     
             except Exception as e:
                 continue
-                
-        return False
+        
+        # Cache the result
+        if self.dns_cache:
+            await self.dns_cache.set(hostname, "RESOLVE", resolves, ttl=3600)  # Cache for 1 hour
+            
+        return resolves
         
     async def _check_domain_availability_rdap(self, domain: str) -> Tuple[bool, str]:
-        """Check domain availability using RDAP"""
+        """Check domain availability using RDAP with caching"""
+        # Check cache first
+        if self.dns_cache:
+            cached_result = await self.dns_cache.get(domain, "RDAP")
+            if cached_result is not None:
+                self._log_verbose(f"Using cached RDAP result", domain)
+                return cached_result
+        
         try:
             tld = domain.split('.')[-1]
             rdap_url = f"https://rdap.org/domain/{domain}"
@@ -324,21 +476,40 @@ class EmailSecurityScanner:
             if self.session:
                 async with self.session.get(rdap_url) as response:
                     if response.status == 404:
-                        return True, "Domain available (RDAP 404)"
+                        result = (True, "Domain available (RDAP 404)")
                     elif response.status == 200:
                         data = await response.json()
                         if 'status' in data and any('active' in str(s).lower() for s in data['status']):
-                            return False, "Domain registered (RDAP active)"
+                            result = (False, "Domain registered (RDAP active)")
                         else:
-                            return True, "Domain status unclear (RDAP)"
+                            result = (True, "Domain status unclear (RDAP)")
                     else:
-                        return False, f"RDAP check failed (HTTP {response.status})"
+                        result = (False, f"RDAP check failed (HTTP {response.status})")
+                        
+                    # Cache the result
+                    if self.dns_cache:
+                        await self.dns_cache.set(domain, "RDAP", result, ttl=1800)  # Cache for 30 minutes
+                        
+                    return result
         except Exception as e:
             self._log_verbose(f"RDAP check failed for {domain}: {str(e)}", domain)
-            return False, f"RDAP error: {str(e)}"
+            result = (False, f"RDAP error: {str(e)}")
+            
+            # Cache negative results for shorter time
+            if self.dns_cache:
+                await self.dns_cache.set(domain, "RDAP", result, ttl=300)  # Cache for 5 minutes
+                
+            return result
             
     async def _check_domain_availability(self, domain: str) -> Tuple[bool, str]:
-        """Check if domain is available for registration using WHOIS with RDAP fallback"""
+        """Check if domain is available for registration using WHOIS with RDAP fallback and caching"""
+        # Check cache first
+        if self.dns_cache:
+            cached_result = await self.dns_cache.get(domain, "WHOIS")
+            if cached_result is not None:
+                self._log_verbose(f"Using cached WHOIS result", domain)
+                return cached_result
+        
         try:
             self._log_verbose(f"Checking WHOIS for domain availability: {domain}", domain)
             
@@ -348,7 +519,7 @@ class EmailSecurityScanner:
                 lambda: whois.whois(domain)
             )
             
-            
+            # Check availability indicators
             availability_indicators = [
                 whois_info is None,
                 not whois_info,
@@ -365,20 +536,26 @@ class EmailSecurityScanner:
             is_available = any(availability_indicators)
             
             if is_available:
-                return True, "Domain available for registration (WHOIS)"
+                result = (True, "Domain available for registration (WHOIS)")
             else:
-                return False, "Domain is registered (WHOIS)"
+                result = (False, "Domain is registered (WHOIS)")
+                
+            # Cache the result
+            if self.dns_cache:
+                await self.dns_cache.set(domain, "WHOIS", result, ttl=1800)  # Cache for 30 minutes
+                
+            return result
                 
         except Exception as e:
             self._log_verbose(f"WHOIS failed for {domain}, trying RDAP: {str(e)}", domain)
-
+            # Fall back to RDAP
             return await self._check_domain_availability_rdap(domain)
             
     async def _scan_mx_records(self, domain: str) -> Tuple[VulnerabilityStatus, List[MXRecord], List[str], str, Dict]:
-        """Scan MX records for vulnerabilities"""
+        """Scan MX records for vulnerabilities with caching"""
         self._log_verbose(f"Scanning MX records", domain)
         
-        # get mx records
+        # Get MX records from both DNS and DoH
         mx_records_dns = await self._get_mx_records_dns(domain)
         mx_records_doh = await self._get_mx_records_doh(domain)
         
@@ -406,12 +583,12 @@ class EmailSecurityScanner:
                 "vulnerable": False
             }
             
-
+            # Check if MX hostname resolves
             resolves = await self._resolve_hostname(mx_hostname)
             check_detail["resolves"] = resolves
             
             if not resolves:
-
+                # Check if the domain is available for registration
                 is_available, availability_msg = await self._check_domain_availability(mx_hostname)
                 check_detail["available"] = is_available
                 check_detail["availability_message"] = availability_msg
@@ -422,7 +599,7 @@ class EmailSecurityScanner:
             
             details["checks"].append(check_detail)
         
-
+        # Determine overall status
         if vulnerable_mx:
             status = VulnerabilityStatus.VULNERABLE
             message = f"Found {len(vulnerable_mx)} vulnerable MX record(s): {', '.join(vulnerable_mx)}"
@@ -433,7 +610,7 @@ class EmailSecurityScanner:
         return status, mx_records, vulnerable_mx, message, details
         
     async def _scan_spf_record(self, domain: str) -> Tuple[VulnerabilityStatus, Optional[SPFRecord], str]:
-        """Scan SPF record for vulnerabilities"""
+        """Scan SPF record for vulnerabilities with caching"""
         self._log_verbose(f"Scanning SPF record", domain)
         
         txt_records = await self._get_txt_records(domain)
@@ -448,11 +625,11 @@ class EmailSecurityScanner:
         spf_raw = spf_records[0]
         spf_record = SPFRecord(raw_record=spf_raw)
         
-        
+        # Parse SPF record
         mechanisms = spf_raw.split()
         spf_record.mechanism_count = len(mechanisms) - 1
         
-
+        # Extract includes
         for mechanism in mechanisms:
             if mechanism.startswith('include:'):
                 include_domain = mechanism[8:]  # Remove 'include:'
@@ -515,7 +692,7 @@ class EmailSecurityScanner:
         return key_type.lower(), key_length
         
     async def _scan_dkim_records(self, domain: str, selectors: List[str]) -> Tuple[VulnerabilityStatus, List[DKIMRecord], str]:
-        """Scan DKIM records for vulnerabilities"""
+        """Scan DKIM records for vulnerabilities with caching"""
         self._log_verbose(f"Scanning DKIM records with selectors: {', '.join(selectors)}", domain)
         
         dkim_records = []
@@ -558,7 +735,7 @@ class EmailSecurityScanner:
         return status, dkim_records, message
         
     async def _scan_dmarc_record(self, domain: str) -> Tuple[VulnerabilityStatus, Optional[DMARCRecord], str]:
-        """Scan DMARC record for vulnerabilities"""
+        """Scan DMARC record for vulnerabilities with caching"""
         self._log_verbose(f"Scanning DMARC record", domain)
         
         dmarc_domain = f"_dmarc.{domain}"
@@ -651,21 +828,21 @@ class EmailSecurityScanner:
                 result.mx_message = mx_message
                 result.details['mx'] = mx_details
             
-            # Process SPF results
+           
             if 'spf' in scan_results:
                 spf_status, spf_record, spf_message = scan_results['spf']
                 result.spf_status = spf_status
                 result.spf_record = spf_record
                 result.spf_message = spf_message
             
-            # Process DKIM results
+            
             if 'dkim' in scan_results:
                 dkim_status, dkim_records, dkim_message = scan_results['dkim']
                 result.dkim_status = dkim_status
                 result.dkim_records = dkim_records
                 result.dkim_message = dkim_message
             
-            # Process DMARC results
+            
             if 'dmarc' in scan_results:
                 dmarc_status, dmarc_record, dmarc_message = scan_results['dmarc']
                 result.dmarc_status = dmarc_status
@@ -673,6 +850,10 @@ class EmailSecurityScanner:
                 result.dmarc_message = dmarc_message
             
             result.scan_time = time.time() - start_time
+            
+            
+            if self.dns_cache:
+                result.cache_stats = self.dns_cache.get_stats()
             
             return result
             
@@ -707,8 +888,10 @@ class EmailSecurityScanner:
                 )
         
         self.logger.info(f"Starting scan of {len(domains)} domains with concurrency {self.concurrency}")
+        if self.dns_cache:
+            self.logger.info(f"DNS caching enabled (TTL: {self.dns_cache.default_ttl}s, Max size: {self.dns_cache.max_size})")
         
-        # Create progress bar if requested
+       
         pbar = None
         if show_progress:
             pbar = tqdm(total=len(domains), desc="Scanning domains", unit="domain")
@@ -725,7 +908,7 @@ class EmailSecurityScanner:
         if pbar:
             pbar.close()
         
-        # exceptions
+       
         clean_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
@@ -740,13 +923,30 @@ class EmailSecurityScanner:
             else:
                 clean_results.append(result)
         
+        # Log final cache statistics
+        if self.dns_cache and self.verbose:
+            cache_stats = self.dns_cache.get_stats()
+            self.logger.info(f"Final DNS cache stats: {cache_stats}")
+        
         return clean_results
+    
+    async def clear_cache(self) -> None:
+        """Clear DNS cache"""
+        if self.dns_cache:
+            await self.dns_cache.clear()
+            self.logger.info("DNS cache cleared")
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get current DNS cache statistics"""
+        if self.dns_cache:
+            return self.dns_cache.get_stats()
+        return {"caching_disabled": True}
 
 class OutputManager:
     """Handle various output formats"""
     
     @staticmethod
-    def print_human_readable(results: List[EmailSecurityResult], verbose: bool = False):
+    def print_human_readable(results: List[EmailSecurityResult], verbose: bool = False, show_cache_stats: bool = False):
         """Print results in human-readable format"""
         print(f"\nEmail Security Scanner Results ({len(results)} domains scanned)")
         print("=" * 80)
@@ -761,7 +961,18 @@ class OutputManager:
         print(f"  MX Vulnerabilities: {mx_vulnerable}")
         print(f"  SPF Issues: {spf_issues}")
         print(f"  DKIM Issues: {dkim_issues}")
-        print(f"  DMARC Issues: {dmarc_issues}\n")
+        print(f"  DMARC Issues: {dmarc_issues}")
+        
+        
+        if show_cache_stats and results and results[0].cache_stats and "caching_disabled" not in results[0].cache_stats:
+            cache_stats = results[0].cache_stats
+            print(f"\nDNS Cache Performance:")
+            print(f"  Cache Hit Rate: {cache_stats['hit_rate']}%")
+            print(f"  Cache Hits: {cache_stats['hits']}")
+            print(f"  Cache Misses: {cache_stats['misses']}")
+            print(f"  Cache Size: {cache_stats['cache_size']}/{cache_stats['max_size']}")
+        
+        print()
         
         for result in results:
             print(f"Domain: {result.domain}")
@@ -829,6 +1040,7 @@ class OutputManager:
                 "dkim_issues": sum(1 for r in results if r.dkim_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING]),
                 "dmarc_issues": sum(1 for r in results if r.dmarc_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING])
             },
+            "cache_stats": results[0].cache_stats if results and results[0].cache_stats else {},
             "results": [asdict(result) for result in results]
         }
         print(json.dumps(json_data, indent=2, default=str))
@@ -845,6 +1057,7 @@ class OutputManager:
                 "dkim_issues": sum(1 for r in results if r.dkim_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING]),
                 "dmarc_issues": sum(1 for r in results if r.dmarc_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING])
             },
+            "cache_stats": results[0].cache_stats if results and results[0].cache_stats else {},
             "results": [asdict(result) for result in results]
         }
         
@@ -881,7 +1094,7 @@ def parse_domains_input(domain_input: str) -> List[str]:
     """Parse domain input from various sources"""
     domains = []
     
-
+    
     if Path(domain_input).is_file():
         try:
             with open(domain_input, 'r') as f:
@@ -893,7 +1106,7 @@ def parse_domains_input(domain_input: str) -> List[str]:
             print(f"Error reading file {domain_input}: {str(e)}", file=sys.stderr)
             sys.exit(1)
     else:
-
+        
         for domain in domain_input.replace(',', ' ').replace(';', ' ').split():
             domain = domain.strip()
             if domain:
@@ -904,16 +1117,17 @@ def parse_domains_input(domain_input: str) -> List[str]:
 async def main():
     """Main function"""
     parser = argparse.ArgumentParser(
-        description="Professional Email Security Scanner (MX, SPF, DKIM, DMARC)",
+        description="Professional Email Security Scanner with DNS Caching (MX, SPF, DKIM, DMARC)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python emailsec_scanner.py example.com --full
-  python emailsec_scanner.py "example.com,test.com" --spf --dmarc
-  python emailsec_scanner.py domains.txt --mx --progress
-  python emailsec_scanner.py domains.txt --full --json results.json --csv results.csv
-  python emailsec_scanner.py example.com --dkim --dkim-selectors default,google,mail
-  python emailsec_scanner.py example.com --full --stdout-json > results.json
+  python mailguard.py example.com --full
+  python mailguard.py "example.com,test.com" --spf --dmarc --cache-stats
+  python mailguard.py domains.txt --mx --progress --no-cache
+  python mailguard.py domains.txt --full --json results.json --csv results.csv
+  python mailguard.py example.com --dkim --dkim-selectors default,google,mail
+  python mailguard.py example.com --full --stdout-json > results.json
+  python mailguard.py domains.txt --full --cache-ttl 600 --cache-size 5000
         """
     )
     
@@ -950,7 +1164,7 @@ Examples:
         help='Enable all security scans (MX + SPF + DKIM + DMARC)'
     )
     
-    # Configuration options
+    # Configuration
     config_group = parser.add_argument_group('Configuration')
     config_group.add_argument(
         '--threads', '--concurrency',
@@ -967,6 +1181,31 @@ Examples:
     config_group.add_argument(
         '--dkim-selectors',
         help='Comma-separated list of DKIM selectors to check (default: common selectors)'
+    )
+    
+    # Caching
+    cache_group = parser.add_argument_group('DNS Caching Options')
+    cache_group.add_argument(
+        '--no-cache',
+        action='store_true',
+        help='Disable DNS response caching'
+    )
+    cache_group.add_argument(
+        '--cache-ttl',
+        type=int,
+        default=300,
+        help='DNS cache TTL in seconds (default: 300)'
+    )
+    cache_group.add_argument(
+        '--cache-size',
+        type=int,
+        default=10000,
+        help='Maximum DNS cache entries (default: 10000)'
+    )
+    cache_group.add_argument(
+        '--cache-stats',
+        action='store_true',
+        help='Show DNS cache performance statistics'
     )
     
     # Output options
@@ -998,23 +1237,23 @@ Examples:
     parser.add_argument(
         '--version',
         action='version',
-        version='Email Security Scanner 2.0.0'
+        version='MailGuard Email Security Scanner 2.1.0 (with DNS Caching)'
     )
     
     args = parser.parse_args()
     
-    # Parse domains
+
     domains = parse_domains_input(args.domains)
     if not domains:
         print("Error: No valid domains found", file=sys.stderr)
         sys.exit(1)
     
-    # Determine which scans to enable
+
     enable_mx = args.mx or args.full
     enable_spf = args.spf or args.full
     enable_dkim = args.dkim or args.full
     enable_dmarc = args.dmarc or args.full
-    
+
 
     if not any([args.mx, args.spf, args.dkim, args.dmarc, args.full]):
         enable_mx = True
@@ -1031,14 +1270,22 @@ Examples:
         if enable_dkim: scan_types.append("DKIM")
         if enable_dmarc: scan_types.append("DMARC")
         
-        print(f"Email Security Scanner v2.0.0")
+        print(f"MailGuard Email Security Scanner v2.1.0 (DNS Caching)")
         print(f"Scanning {len(domains)} domain(s) for: {', '.join(scan_types)}")
+        
+        if not args.no_cache:
+            print(f"DNS Caching: Enabled (TTL: {args.cache_ttl}s, Max size: {args.cache_size})")
+        else:
+            print(f"DNS Caching: Disabled")
     
-    #run
+
     async with EmailSecurityScanner(
         concurrency=args.threads,
         timeout=args.timeout,
-        verbose=args.verbose
+        verbose=args.verbose,
+        enable_cache=not args.no_cache,
+        cache_ttl=args.cache_ttl,
+        cache_size=args.cache_size
     ) as scanner:
         results = await scanner.scan_domains(
             domains,
@@ -1050,11 +1297,11 @@ Examples:
             show_progress=args.progress
         )
     
-    # Output results
+    # Output
     if args.stdout_json:
         OutputManager.print_stdout_json(results)
     else:
-        OutputManager.print_human_readable(results, verbose=args.verbose)
+        OutputManager.print_human_readable(results, verbose=args.verbose, show_cache_stats=args.cache_stats)
     
     if args.json:
         OutputManager.save_json(results, args.json)
@@ -1062,7 +1309,7 @@ Examples:
     if args.csv:
         OutputManager.save_csv(results, args.csv)
     
-    # Exit code
+
     has_vulnerabilities = any(
         result.mx_status == VulnerabilityStatus.VULNERABLE or
         result.spf_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING] or
