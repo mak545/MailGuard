@@ -4,7 +4,7 @@ MailGuard - Comprehensive Email Security Vulnerability Scanner with DNS Caching
 Author: Mohamed Essam
 License: MIT
 Description: Scans MX, SPF, DKIM, and DMARC records for security vulnerabilities
-Enhanced with DNS response caching for improved performance
+Enhanced with DNS response caching and SMTP vulnerability scanning
 """
 
 import asyncio
@@ -17,6 +17,9 @@ import time
 import re
 import base64
 import hashlib
+import socket
+import ssl
+import warnings
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Any, NamedTuple
 from dataclasses import dataclass, asdict, field
@@ -27,8 +30,6 @@ import whois
 import dns.resolver
 import dns.exception
 from concurrent.futures import ThreadPoolExecutor
-import ssl
-import warnings
 from tqdm import tqdm
 
 
@@ -41,6 +42,13 @@ class VulnerabilityStatus(Enum):
     ERROR = "ERROR"
     TIMEOUT = "TIMEOUT"
     MISSING = "MISSING"
+
+class SeverityLevel(Enum):
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
 
 class DNSCacheEntry(NamedTuple):
     """DNS cache entry with timestamp and TTL"""
@@ -158,6 +166,25 @@ class DMARCRecord:
     rua_addresses: List[str] = field(default_factory=list)
 
 @dataclass
+class TLSConfig:
+    supported: bool = False
+    versions: List[str] = field(default_factory=list)
+    weak_versions: List[str] = field(default_factory=list)
+    weak_ciphers: List[str] = field(default_factory=list)
+    certificate_valid: bool = False
+    certificate_self_signed: bool = False
+    certificate_errors: List[str] = field(default_factory=list)
+
+@dataclass
+class SMTPVulnerabilities:
+    starttls: Optional[TLSConfig] = None
+    vrfy_enabled: bool = False
+    expn_enabled: bool = False
+    vrfy_valid_users: List[str] = field(default_factory=list)
+    open_relay: bool = False
+    open_relay_test_results: List[Dict] = field(default_factory=list)
+
+@dataclass
 class EmailSecurityResult:
     domain: str
     
@@ -178,9 +205,369 @@ class EmailSecurityResult:
     dmarc_record: Optional[DMARCRecord] = None
     dmarc_message: str = ""
     
+    smtp_status: VulnerabilityStatus = VulnerabilityStatus.ERROR
+    smtp_vulnerabilities: Optional[SMTPVulnerabilities] = None
+    smtp_message: str = ""
+    
     scan_time: float = 0.0
     details: Dict[str, Any] = field(default_factory=dict)
     cache_stats: Dict[str, Any] = field(default_factory=dict)
+
+class SMTPScanner:
+    """SMTP vulnerability scanner for STARTTLS, VRFY/EXPN, and open relay checks"""
+    
+    # Weak TLS versions to check
+    WEAK_TLS_VERSIONS = [
+        ssl.PROTOCOL_SSLv23,
+        ssl.PROTOCOL_SSLv23,
+        ssl.PROTOCOL_TLSv1,
+        ssl.PROTOCOL_TLSv1_1
+    ]
+    
+    # Common usernames for VRFY/EXPN testing
+    COMMON_USERNAMES = [
+        'root', 'admin', 'administrator', 'webmaster', 'hostmaster', 'postmaster',
+        'info', 'test', 'user', 'username', 'demo', 'guest', 'email', 'mail'
+    ]
+    
+    def __init__(self, timeout: int = 10, verbose: bool = False):
+        self.timeout = timeout
+        self.verbose = verbose
+        self.logger = self._setup_logger()
+        
+    def _setup_logger(self) -> logging.Logger:
+        """Setup logging configuration"""
+        logger = logging.getLogger('smtp_scanner')
+        logger.setLevel(logging.DEBUG if self.verbose else logging.INFO)
+        
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+        
+        return logger
+        
+    def _log_verbose(self, message: str, hostname: str = ""):
+        """Log verbose messages"""
+        if self.verbose:
+            prefix = f"[{hostname}] " if hostname else ""
+            self.logger.debug(f"{prefix}{message}")
+            
+    async def _test_smtp_connection(self, hostname: str, port: int = 25) -> Optional[socket.socket]:
+        """Test SMTP connection to host"""
+        try:
+            # Create socket connection
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(hostname, port),
+                timeout=self.timeout
+            )
+            
+            # Read banner
+            banner = await reader.readuntil(b'\n')
+            self._log_verbose(f"SMTP banner: {banner.decode().strip()}", hostname)
+            
+            return reader, writer
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError) as e:
+            self._log_verbose(f"SMTP connection failed: {str(e)}", hostname)
+            return None, None
+            
+    async def _send_smtp_command(self, writer, reader, command: str) -> Optional[str]:
+        """Send SMTP command and return response"""
+        try:
+            writer.write(command.encode() + b'\r\n')
+            await writer.drain()
+            
+            response = await asyncio.wait_for(
+                reader.readuntil(b'\n'),
+                timeout=self.timeout
+            )
+            
+            return response.decode().strip()
+        except (asyncio.TimeoutError, ConnectionError):
+            return None
+            
+    async def _check_starttls_support(self, reader, writer, hostname: str) -> Tuple[bool, str]:
+        """Check if STARTTLS is supported"""
+        try:
+            # Send EHLO
+            response = await self._send_smtp_command(writer, reader, "EHLO example.com")
+            if not response or not response.startswith('250'):
+                return False, "EHLO command failed"
+                
+            # Check for STARTTLS in capabilities
+            starttls_supported = False
+            capabilities = []
+            
+            # Read multiline response
+            while True:
+                try:
+                    line = await asyncio.wait_for(
+                        reader.readuntil(b'\n'),
+                        timeout=1.0
+                    )
+                    line = line.decode().strip()
+                    
+                    if line.startswith('250 '):
+                        capabilities.append(line[4:])
+                        if 'STARTTLS' in line:
+                            starttls_supported = True
+                    elif not line or line.startswith('250-'):
+                        # Continuation line
+                        capabilities.append(line[4:] if line.startswith('250-') else line)
+                    else:
+                        break
+                except (asyncio.TimeoutError, ConnectionError):
+                    break
+                    
+            if not starttls_supported:
+                return False, "STARTTLS not supported"
+                
+            # Send STARTTLS command
+            response = await self._send_smtp_command(writer, reader, "STARTTLS")
+            if not response or not response.startswith('220'):
+                return False, "STARTTLS command failed"
+                
+            return True, "STARTTLS supported"
+            
+        except Exception as e:
+            return False, f"STARTTLS check error: {str(e)}"
+            
+    async def _test_tls_versions(self, hostname: str, port: int = 25) -> TLSConfig:
+        """Test TLS versions and ciphers for SMTP server"""
+        tls_config = TLSConfig()
+        
+        for ssl_version in [ssl.PROTOCOL_TLS_CLIENT] + self.WEAK_TLS_VERSIONS:
+            version_name = self._get_ssl_version_name(ssl_version)
+            
+            try:
+                # Create SSL context
+                context = ssl.SSLContext(ssl_version)
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                
+                # Connect and test
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(hostname, port, ssl=context),
+                    timeout=self.timeout
+                )
+                
+                # Connection successful
+                tls_config.supported = True
+                tls_config.versions.append(version_name)
+                
+                # Check if version is weak
+                if ssl_version in self.WEAK_TLS_VERSIONS:
+                    tls_config.weak_versions.append(version_name)
+                    
+                # Get cipher information
+                cipher = writer.get_extra_info('cipher')
+                if cipher:
+                    cipher_name = cipher[0]
+                    tls_config.weak_ciphers.append(cipher_name)
+                
+                # Check certificate
+                cert = writer.get_extra_info('peercert')
+                if cert:
+                    # Basic certificate validation
+                    try:
+                        # Check if certificate is self-signed
+                        issuer = dict(x[0] for x in cert['issuer'])
+                        subject = dict(x[0] for x in cert['subject'])
+                        tls_config.certificate_self_signed = issuer == subject
+                        
+                        # Check certificate validity period
+                        current_time = time.time()
+                        not_before = ssl.cert_time_to_seconds(cert['notBefore'])
+                        not_after = ssl.cert_time_to_seconds(cert['notAfter'])
+                        
+                        if current_time < not_before or current_time > not_after:
+                            tls_config.certificate_errors.append("Certificate not valid for current date")
+                        else:
+                            tls_config.certificate_valid = True
+                            
+                    except (KeyError, ValueError) as e:
+                        tls_config.certificate_errors.append(f"Certificate parsing error: {str(e)}")
+                
+                writer.close()
+                await writer.wait_closed()
+                
+            except (ssl.SSLError, asyncio.TimeoutError, OSError) as e:
+                self._log_verbose(f"TLS {version_name} not supported: {str(e)}", hostname)
+                continue
+                
+        return tls_config
+        
+    def _get_ssl_version_name(self, ssl_version: int) -> str:
+        """Get human-readable SSL version name"""
+        version_map = {
+            ssl.PROTOCOL_TLS_CLIENT: "TLS",
+            ssl.PROTOCOL_SSLv2: "SSLv2",
+            ssl.PROTOCOL_SSLv3: "SSLv3",
+            ssl.PROTOCOL_TLSv1: "TLSv1",
+            ssl.PROTOCOL_TLSv1_1: "TLSv1.1"
+        }
+        return version_map.get(ssl_version, "Unknown")
+        
+    async def _check_vrfy_expn(self, reader, writer, hostname: str, usernames: List[str] = None) -> Tuple[bool, bool, List[str]]:
+        """Check if VRFY and EXPN commands are enabled and test usernames"""
+        vrfy_enabled = False
+        expn_enabled = False
+        valid_users = []
+        
+        if usernames is None:
+            usernames = self.COMMON_USERNAMES
+            
+        # Test VRFY command
+        try:
+            response = await self._send_smtp_command(writer, reader, "VRFY test")
+            if response and (response.startswith('250') or response.startswith('252')):
+                vrfy_enabled = True
+                self._log_verbose("VRFY command enabled", hostname)
+                
+                # Test common usernames
+                for username in usernames[:5]:  # Limit to 5 usernames to avoid detection
+                    response = await self._send_smtp_command(writer, reader, f"VRFY {username}")
+                    if response and (response.startswith('250') or response.startswith('252')):
+                        valid_users.append(username)
+                        self._log_verbose(f"VRFY found valid user: {username}", hostname)
+                    # Small delay to avoid rate limiting
+                    await asyncio.sleep(0.5)
+        except Exception as e:
+            self._log_verbose(f"VRFY check error: {str(e)}", hostname)
+            
+        # Test EXPN command
+        try:
+            response = await self._send_smtp_command(writer, reader, "EXPN test")
+            if response and (response.startswith('250') or response.startswith('252')):
+                expn_enabled = True
+                self._log_verbose("EXPN command enabled", hostname)
+        except Exception as e:
+            self._log_verbose(f"EXPN check error: {str(e)}", hostname)
+            
+        return vrfy_enabled, expn_enabled, valid_users
+        
+    async def _test_open_relay(self, reader, writer, hostname: str) -> Tuple[bool, List[Dict]]:
+        """Test if SMTP server is an open relay"""
+        test_cases = [
+            {
+                "from": "attacker@external.com",
+                "to": "victim@example.com",
+                "expected_relay": False,
+                "description": "External to external (should be blocked)"
+            },
+            {
+                "from": "user@example.com",
+                "to": "recipient@example.com",
+                "expected_relay": True,
+                "description": "Internal to internal (should be allowed)"
+            },
+            {
+                "from": "user@example.com",
+                "to": "recipient@external.com",
+                "expected_relay": True,
+                "description": "Internal to external (should be allowed)"
+            }
+        ]
+        
+        open_relay = False
+        results = []
+        
+        for test_case in test_cases:
+            try:
+                # Reset connection state
+                await self._send_smtp_command(writer, reader, "RSET")
+                
+                # Set MAIL FROM
+                response = await self._send_smtp_command(writer, reader, f"MAIL FROM:<{test_case['from']}>")
+                if not response or not response.startswith('250'):
+                    results.append({
+                        **test_case,
+                        "result": "FAIL",
+                        "reason": f"MAIL FROM rejected: {response}"
+                    })
+                    continue
+                    
+                # Set RCPT TO
+                response = await self._send_smtp_command(writer, reader, f"RCPT TO:<{test_case['to']}>")
+                relay_allowed = response and response.startswith('250')
+                
+                results.append({
+                    **test_case,
+                    "result": "ALLOWED" if relay_allowed else "REJECTED",
+                    "relay_allowed": relay_allowed
+                })
+                
+                # If external to external is allowed, it's an open relay
+                if (not test_case["expected_relay"] and relay_allowed):
+                    open_relay = True
+                    
+            except Exception as e:
+                results.append({
+                    **test_case,
+                    "result": "ERROR",
+                    "reason": str(e)
+                })
+                
+            # Small delay between tests
+            await asyncio.sleep(0.5)
+            
+        return open_relay, results
+        
+    async def scan_smtp_vulnerabilities(self, mx_records: List[MXRecord], 
+                                      usernames: List[str] = None,
+                                      test_open_relay: bool = True) -> SMTPVulnerabilities:
+        """Scan SMTP server for vulnerabilities"""
+        vulnerabilities = SMTPVulnerabilities()
+        
+        if not mx_records:
+            return vulnerabilities
+            
+        # Use the highest priority MX record
+        mx_record = sorted(mx_records, key=lambda x: x.priority)[0]
+        hostname = mx_record.hostname
+        
+        self._log_verbose(f"Scanning SMTP vulnerabilities for {hostname}")
+        
+        try:
+            # Test basic SMTP connection
+            reader, writer = await self._test_smtp_connection(hostname)
+            if not reader:
+                self._log_verbose(f"Failed to connect to {hostname}")
+                return vulnerabilities
+                
+            # Check STARTTLS support
+            starttls_supported, starttls_message = await self._check_starttls_support(reader, writer, hostname)
+            
+            if starttls_supported:
+                # Test TLS configurations
+                vulnerabilities.starttls = await self._test_tls_versions(hostname)
+            else:
+                vulnerabilities.starttls = TLSConfig(supported=False)
+                self._log_verbose(f"STARTTLS not supported on {hostname}")
+                
+            # Check VRFY/EXPN
+            vrfy_enabled, expn_enabled, valid_users = await self._check_vrfy_expn(reader, writer, hostname, usernames)
+            vulnerabilities.vrfy_enabled = vrfy_enabled
+            vulnerabilities.expn_enabled = expn_enabled
+            vulnerabilities.vrfy_valid_users = valid_users
+            
+            # Test for open relay if enabled
+            if test_open_relay:
+                open_relay, test_results = await self._test_open_relay(reader, writer, hostname)
+                vulnerabilities.open_relay = open_relay
+                vulnerabilities.open_relay_test_results = test_results
+                
+            # Close connection
+            writer.close()
+            await writer.wait_closed()
+            
+        except Exception as e:
+            self._log_verbose(f"SMTP scan error for {hostname}: {str(e)}")
+            
+        return vulnerabilities
 
 class EmailSecurityScanner:
     """Professional Email Security Scanner with comprehensive checks and DNS caching"""
@@ -212,6 +599,7 @@ class EmailSecurityScanner:
         self.session: Optional[aiohttp.ClientSession] = None
         self.logger = self._setup_logger()
         self.executor = ThreadPoolExecutor(max_workers=concurrency)
+        self.smtp_scanner = SMTPScanner(timeout=timeout, verbose=verbose)
         
         # DNS caching
         self.enable_cache = enable_cache
@@ -790,9 +1178,58 @@ class EmailSecurityScanner:
         
         return status, dmarc_record, message
         
+    async def _scan_smtp_vulnerabilities(self, domain: str, mx_records: List[MXRecord], 
+                                       usernames: List[str] = None,
+                                       test_open_relay: bool = True) -> Tuple[VulnerabilityStatus, Optional[SMTPVulnerabilities], str]:
+        """Scan SMTP server for vulnerabilities"""
+        self._log_verbose(f"Scanning SMTP vulnerabilities", domain)
+        
+        if not mx_records:
+            return VulnerabilityStatus.MISSING, None, "No MX records available for SMTP testing"
+        
+        try:
+            vulnerabilities = await self.smtp_scanner.scan_smtp_vulnerabilities(
+                mx_records, usernames, test_open_relay
+            )
+            
+            # Determine overall status
+            issues = []
+            
+            if vulnerabilities.starttls:
+                if vulnerabilities.starttls.weak_versions:
+                    issues.append(f"Weak TLS versions: {', '.join(vulnerabilities.starttls.weak_versions)}")
+                if vulnerabilities.starttls.weak_ciphers:
+                    issues.append(f"Weak ciphers: {', '.join(vulnerabilities.starttls.weak_ciphers)}")
+                if not vulnerabilities.starttls.certificate_valid:
+                    issues.append("Invalid certificate")
+            
+            if vulnerabilities.vrfy_enabled:
+                issues.append("VRFY command enabled")
+            if vulnerabilities.expn_enabled:
+                issues.append("EXPN command enabled")
+            if vulnerabilities.vrfy_valid_users:
+                issues.append(f"Valid users found: {', '.join(vulnerabilities.vrfy_valid_users)}")
+            if vulnerabilities.open_relay:
+                issues.append("Open relay detected")
+            
+            if issues:
+                status = VulnerabilityStatus.VULNERABLE
+                message = f"SMTP vulnerabilities found: {', '.join(issues)}"
+            else:
+                status = VulnerabilityStatus.SAFE
+                message = "No SMTP vulnerabilities detected"
+                
+            return status, vulnerabilities, message
+            
+        except Exception as e:
+            self._log_verbose(f"SMTP scan error: {str(e)}", domain)
+            return VulnerabilityStatus.ERROR, None, f"SMTP scan error: {str(e)}"
+        
     async def _scan_single_domain(self, domain: str, enable_mx: bool, enable_spf: bool, 
                                 enable_dkim: bool, enable_dmarc: bool, 
-                                dkim_selectors: List[str]) -> EmailSecurityResult:
+                                enable_smtp: bool, dkim_selectors: List[str],
+                                smtp_usernames: List[str] = None,
+                                test_open_relay: bool = True) -> EmailSecurityResult:
         """Scan a single domain for email security vulnerabilities"""
         start_time = time.time()
         domain = domain.strip().lower()
@@ -828,30 +1265,39 @@ class EmailSecurityScanner:
                 result.mx_message = mx_message
                 result.details['mx'] = mx_details
             
-           
+            # Process SPF results
             if 'spf' in scan_results:
                 spf_status, spf_record, spf_message = scan_results['spf']
                 result.spf_status = spf_status
                 result.spf_record = spf_record
                 result.spf_message = spf_message
             
-            
+            # Process DKIM results
             if 'dkim' in scan_results:
                 dkim_status, dkim_records, dkim_message = scan_results['dkim']
                 result.dkim_status = dkim_status
                 result.dkim_records = dkim_records
                 result.dkim_message = dkim_message
             
-            
+            # Process DMARC results
             if 'dmarc' in scan_results:
                 dmarc_status, dmarc_record, dmarc_message = scan_results['dmarc']
                 result.dmarc_status = dmarc_status
                 result.dmarc_record = dmarc_record
                 result.dmarc_message = dmarc_message
             
+            # Process SMTP vulnerabilities if enabled and we have MX records
+            if enable_smtp and 'mx' in scan_results and scan_results['mx'][1]:  # Check if we have MX records
+                smtp_status, smtp_vulnerabilities, smtp_message = await self._scan_smtp_vulnerabilities(
+                    domain, scan_results['mx'][1], smtp_usernames, test_open_relay
+                )
+                result.smtp_status = smtp_status
+                result.smtp_vulnerabilities = smtp_vulnerabilities
+                result.smtp_message = smtp_message
+            
             result.scan_time = time.time() - start_time
             
-            
+            # Add cache statistics
             if self.dns_cache:
                 result.cache_stats = self.dns_cache.get_stats()
             
@@ -873,8 +1319,9 @@ class EmailSecurityScanner:
             
     async def scan_domains(self, domains: List[str], enable_mx: bool = True, 
                           enable_spf: bool = False, enable_dkim: bool = False,
-                          enable_dmarc: bool = False, dkim_selectors: List[str] = None,
-                          show_progress: bool = False) -> List[EmailSecurityResult]:
+                          enable_dmarc: bool = False, enable_smtp: bool = False,
+                          dkim_selectors: List[str] = None, smtp_usernames: List[str] = None,
+                          test_open_relay: bool = True, show_progress: bool = False) -> List[EmailSecurityResult]:
         """Scan multiple domains concurrently"""
         semaphore = asyncio.Semaphore(self.concurrency)
         
@@ -884,14 +1331,15 @@ class EmailSecurityScanner:
         async def scan_with_semaphore(domain: str) -> EmailSecurityResult:
             async with semaphore:
                 return await self._scan_single_domain(
-                    domain, enable_mx, enable_spf, enable_dkim, enable_dmarc, dkim_selectors
+                    domain, enable_mx, enable_spf, enable_dkim, enable_dmarc,
+                    enable_smtp, dkim_selectors, smtp_usernames, test_open_relay
                 )
         
         self.logger.info(f"Starting scan of {len(domains)} domains with concurrency {self.concurrency}")
         if self.dns_cache:
             self.logger.info(f"DNS caching enabled (TTL: {self.dns_cache.default_ttl}s, Max size: {self.dns_cache.max_size})")
         
-       
+        # Setup progress bar if requested
         pbar = None
         if show_progress:
             pbar = tqdm(total=len(domains), desc="Scanning domains", unit="domain")
@@ -908,7 +1356,7 @@ class EmailSecurityScanner:
         if pbar:
             pbar.close()
         
-       
+        # Handle exceptions
         clean_results = []
         for i, result in enumerate(results):
             if isinstance(result, Exception):
@@ -956,14 +1404,16 @@ class OutputManager:
         spf_issues = sum(1 for r in results if r.spf_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING])
         dkim_issues = sum(1 for r in results if r.dkim_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING])
         dmarc_issues = sum(1 for r in results if r.dmarc_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING])
+        smtp_issues = sum(1 for r in results if r.smtp_status == VulnerabilityStatus.VULNERABLE)
         
         print(f"Security Issues Found:")
         print(f"  MX Vulnerabilities: {mx_vulnerable}")
         print(f"  SPF Issues: {spf_issues}")
         print(f"  DKIM Issues: {dkim_issues}")
         print(f"  DMARC Issues: {dmarc_issues}")
+        print(f"  SMTP Issues: {smtp_issues}")
         
-        
+        # Show cache statistics if requested
         if show_cache_stats and results and results[0].cache_stats and "caching_disabled" not in results[0].cache_stats:
             cache_stats = results[0].cache_stats
             print(f"\nDNS Cache Performance:")
@@ -1013,6 +1463,36 @@ class OutputManager:
                     if result.dmarc_record.has_rua:
                         print(f"    Reporting: {', '.join(result.dmarc_record.rua_addresses)}")
             
+            # SMTP Results
+            if result.smtp_status != VulnerabilityStatus.ERROR and result.smtp_vulnerabilities:
+                status_color = OutputManager._get_status_color(result.smtp_status)
+                print(f"  [SMTP] {status_color}{result.smtp_status.value}\033[0m - {result.smtp_message}")
+                
+                if verbose and result.smtp_vulnerabilities:
+                    vuln = result.smtp_vulnerabilities
+                    
+                    if vuln.starttls:
+                        print(f"    STARTTLS: {'Supported' if vuln.starttls.supported else 'Not supported'}")
+                        if vuln.starttls.weak_versions:
+                            print(f"      Weak versions: {', '.join(vuln.starttls.weak_versions)}")
+                        if vuln.starttls.weak_ciphers:
+                            print(f"      Weak ciphers: {', '.join(vuln.starttls.weak_ciphers)}")
+                        print(f"      Certificate valid: {vuln.starttls.certificate_valid}")
+                        print(f"      Certificate self-signed: {vuln.starttls.certificate_self_signed}")
+                    
+                    print(f"    VRFY enabled: {vuln.vrfy_enabled}")
+                    print(f"    EXPN enabled: {vuln.expn_enabled}")
+                    
+                    if vuln.vrfy_valid_users:
+                        print(f"    Valid users: {', '.join(vuln.vrfy_valid_users)}")
+                    
+                    print(f"    Open relay: {vuln.open_relay}")
+                    
+                    if vuln.open_relay_test_results:
+                        print("    Open relay test results:")
+                        for test in vuln.open_relay_test_results:
+                            print(f"      {test['description']}: {test['result']}")
+            
             print(f"  Scan Time: {result.scan_time:.2f}s")
             print()
     
@@ -1038,7 +1518,8 @@ class OutputManager:
                 "mx_vulnerable": sum(1 for r in results if r.mx_status == VulnerabilityStatus.VULNERABLE),
                 "spf_issues": sum(1 for r in results if r.spf_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING]),
                 "dkim_issues": sum(1 for r in results if r.dkim_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING]),
-                "dmarc_issues": sum(1 for r in results if r.dmarc_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING])
+                "dmarc_issues": sum(1 for r in results if r.dmarc_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING]),
+                "smtp_issues": sum(1 for r in results if r.smtp_status == VulnerabilityStatus.VULNERABLE)
             },
             "cache_stats": results[0].cache_stats if results and results[0].cache_stats else {},
             "results": [asdict(result) for result in results]
@@ -1055,7 +1536,8 @@ class OutputManager:
                 "mx_vulnerable": sum(1 for r in results if r.mx_status == VulnerabilityStatus.VULNERABLE),
                 "spf_issues": sum(1 for r in results if r.spf_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING]),
                 "dkim_issues": sum(1 for r in results if r.dkim_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING]),
-                "dmarc_issues": sum(1 for r in results if r.dmarc_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING])
+                "dmarc_issues": sum(1 for r in results if r.dmarc_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING]),
+                "smtp_issues": sum(1 for r in results if r.smtp_status == VulnerabilityStatus.VULNERABLE)
             },
             "cache_stats": results[0].cache_stats if results and results[0].cache_stats else {},
             "results": [asdict(result) for result in results]
@@ -1072,7 +1554,8 @@ class OutputManager:
             writer = csv.writer(f)
             writer.writerow([
                 'Domain', 'MX_Status', 'MX_Message', 'SPF_Status', 'SPF_Message',
-                'DKIM_Status', 'DKIM_Message', 'DMARC_Status', 'DMARC_Message', 'Scan_Time'
+                'DKIM_Status', 'DKIM_Message', 'DMARC_Status', 'DMARC_Message',
+                'SMTP_Status', 'SMTP_Message', 'Scan_Time'
             ])
             
             for result in results:
@@ -1086,15 +1569,18 @@ class OutputManager:
                     result.dkim_message,
                     result.dmarc_status.value,
                     result.dmarc_message,
+                    result.smtp_status.value if result.smtp_status else "",
+                    result.smtp_message if result.smtp_message else "",
                     f"{result.scan_time:.2f}"
                 ])
         print(f"Results saved to {filename}")
+    
 
 def parse_domains_input(domain_input: str) -> List[str]:
     """Parse domain input from various sources"""
     domains = []
     
-    
+    # Check if input is a file
     if Path(domain_input).is_file():
         try:
             with open(domain_input, 'r') as f:
@@ -1106,7 +1592,7 @@ def parse_domains_input(domain_input: str) -> List[str]:
             print(f"Error reading file {domain_input}: {str(e)}", file=sys.stderr)
             sys.exit(1)
     else:
-        
+        # Parse as comma/space separated list
         for domain in domain_input.replace(',', ' ').replace(';', ' ').split():
             domain = domain.strip()
             if domain:
@@ -1117,15 +1603,15 @@ def parse_domains_input(domain_input: str) -> List[str]:
 async def main():
     """Main function"""
     parser = argparse.ArgumentParser(
-        description="Professional Email Security Scanner with DNS Caching (MX, SPF, DKIM, DMARC)",
+        description="Professional Email Security Scanner with DNS Caching (MX, SPF, DKIM, DMARC, SMTP)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python mailguard.py example.com --full
-  python mailguard.py "example.com,test.com" --spf --dmarc --cache-stats
+  python mailguard.py "example.com,test.com" --spf --dmarc --smtp --cache-stats
   python mailguard.py domains.txt --mx --progress --no-cache
-  python mailguard.py domains.txt --full --json results.json --csv results.csv
   python mailguard.py example.com --dkim --dkim-selectors default,google,mail
+  python mailguard.py example.com --smtp --smtp-usernames admin,root,test
   python mailguard.py example.com --full --stdout-json > results.json
   python mailguard.py domains.txt --full --cache-ttl 600 --cache-size 5000
         """
@@ -1159,9 +1645,14 @@ Examples:
         help='Scan DMARC records for policy issues'
     )
     scan_group.add_argument(
+        '--smtp',
+        action='store_true',
+        help='Scan SMTP servers for vulnerabilities'
+    )
+    scan_group.add_argument(
         '--full',
         action='store_true',
-        help='Enable all security scans (MX + SPF + DKIM + DMARC)'
+        help='Enable all security scans (MX + SPF + DKIM + DMARC + SMTP)'
     )
     
     # Configuration
@@ -1181,6 +1672,15 @@ Examples:
     config_group.add_argument(
         '--dkim-selectors',
         help='Comma-separated list of DKIM selectors to check (default: common selectors)'
+    )
+    config_group.add_argument(
+        '--smtp-usernames',
+        help='Comma-separated list of usernames to test with VRFY command'
+    )
+    config_group.add_argument(
+        '--no-open-relay-test',
+        action='store_true',
+        help='Disable open relay testing (enabled by default when SMTP scanning)'
     )
     
     # Caching
@@ -1228,6 +1728,7 @@ Examples:
         '--csv',
         help='Save results to CSV file'
     )
+
     output_group.add_argument(
         '--stdout-json',
         action='store_true',
@@ -1237,31 +1738,38 @@ Examples:
     parser.add_argument(
         '--version',
         action='version',
-        version='MailGuard Email Security Scanner 2.1.0 (with DNS Caching)'
+        version='MailGuard Email Security Scanner 3.0.0 (with DNS Caching and SMTP Scanning)'
     )
     
     args = parser.parse_args()
     
-
+    # Parse domain input
     domains = parse_domains_input(args.domains)
     if not domains:
         print("Error: No valid domains found", file=sys.stderr)
         sys.exit(1)
     
-
+    # Determine which scans to enable
     enable_mx = args.mx or args.full
     enable_spf = args.spf or args.full
     enable_dkim = args.dkim or args.full
     enable_dmarc = args.dmarc or args.full
+    enable_smtp = args.smtp or args.full
+    test_open_relay = not args.no_open_relay_test
 
-
-    if not any([args.mx, args.spf, args.dkim, args.dmarc, args.full]):
+    # If no specific scans are requested, enable MX by default
+    if not any([args.mx, args.spf, args.dkim, args.dmarc, args.smtp, args.full]):
         enable_mx = True
     
-
+    # Parse DKIM selectors
     dkim_selectors = None
     if args.dkim_selectors:
         dkim_selectors = [s.strip() for s in args.dkim_selectors.split(',')]
+    
+    # Parse SMTP usernames
+    smtp_usernames = None
+    if args.smtp_usernames:
+        smtp_usernames = [s.strip() for s in args.smtp_usernames.split(',')]
     
     if not args.stdout_json:
         scan_types = []
@@ -1269,8 +1777,9 @@ Examples:
         if enable_spf: scan_types.append("SPF")
         if enable_dkim: scan_types.append("DKIM")
         if enable_dmarc: scan_types.append("DMARC")
+        if enable_smtp: scan_types.append("SMTP")
         
-        print(f"MailGuard Email Security Scanner v2.1.0 (DNS Caching)")
+        print(f"MailGuard Email Security Scanner v3.0.0 (DNS Caching + SMTP Scanning)")
         print(f"Scanning {len(domains)} domain(s) for: {', '.join(scan_types)}")
         
         if not args.no_cache:
@@ -1278,7 +1787,7 @@ Examples:
         else:
             print(f"DNS Caching: Disabled")
     
-
+    # Run the scanner
     async with EmailSecurityScanner(
         concurrency=args.threads,
         timeout=args.timeout,
@@ -1293,11 +1802,13 @@ Examples:
             enable_spf=enable_spf,
             enable_dkim=enable_dkim,
             enable_dmarc=enable_dmarc,
+            enable_smtp=enable_smtp,
             dkim_selectors=dkim_selectors,
+            smtp_usernames=smtp_usernames,
+            test_open_relay=test_open_relay,
             show_progress=args.progress
         )
     
-    # Output
     if args.stdout_json:
         OutputManager.print_stdout_json(results)
     else:
@@ -1308,13 +1819,17 @@ Examples:
     
     if args.csv:
         OutputManager.save_csv(results, args.csv)
+        
+    if args.html:
+        OutputManager.generate_html_report(results, args.html)
     
-
+    
     has_vulnerabilities = any(
         result.mx_status == VulnerabilityStatus.VULNERABLE or
         result.spf_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING] or
         result.dkim_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING] or
-        result.dmarc_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING]
+        result.dmarc_status in [VulnerabilityStatus.VULNERABLE, VulnerabilityStatus.MISSING] or
+        result.smtp_status == VulnerabilityStatus.VULNERABLE
         for result in results
     )
     
