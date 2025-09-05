@@ -51,7 +51,7 @@ class SeverityLevel(Enum):
     INFO = "INFO"
 
 class DNSCacheEntry(NamedTuple):
-    """DNS cache entry with timestamp and TTL"""
+    
     data: Any
     timestamp: float
     ttl: int
@@ -59,7 +59,7 @@ class DNSCacheEntry(NamedTuple):
 
 @dataclass
 class DNSCache:
-    """DNS response caching system"""
+    
     def __init__(self, max_size: int = 10000, default_ttl: int = 300):
         self.cache: Dict[str, DNSCacheEntry] = {}
         self.max_size = max_size
@@ -69,7 +69,7 @@ class DNSCache:
         self.lock = asyncio.Lock()
     
     def _make_cache_key(self, domain: str, record_type: str, resolver: str = "") -> str:
-        """Create a unique cache key for DNS queries"""
+       
         key_data = f"{domain.lower()}:{record_type.upper()}:{resolver}"
         return hashlib.md5(key_data.encode()).hexdigest()
     
@@ -94,7 +94,7 @@ class DNSCache:
             return None
     
     async def set(self, domain: str, record_type: str, data: Any, ttl: int = None, resolver: str = "") -> None:
-        """Cache DNS response"""
+        
         async with self.lock:
             cache_key = self._make_cache_key(domain, record_type, resolver)
             
@@ -113,14 +113,14 @@ class DNSCache:
             )
     
     async def clear(self) -> None:
-        """Clear all cache entries"""
+       
         async with self.lock:
             self.cache.clear()
             self.hits = 0
             self.misses = 0
     
     def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics"""
+     
         total_requests = self.hits + self.misses
         hit_rate = (self.hits / total_requests * 100) if total_requests > 0 else 0
         
@@ -214,7 +214,7 @@ class EmailSecurityResult:
     cache_stats: Dict[str, Any] = field(default_factory=dict)
 
 class SMTPScanner:
-    """SMTP vulnerability scanner for STARTTLS, VRFY/EXPN, and open relay checks"""
+    
     
     # Weak TLS versions to check
     WEAK_TLS_VERSIONS = [
@@ -236,7 +236,7 @@ class SMTPScanner:
         self.logger = self._setup_logger()
         
     def _setup_logger(self) -> logging.Logger:
-        """Setup logging configuration"""
+
         logger = logging.getLogger('smtp_scanner')
         logger.setLevel(logging.DEBUG if self.verbose else logging.INFO)
         
@@ -251,13 +251,13 @@ class SMTPScanner:
         return logger
         
     def _log_verbose(self, message: str, hostname: str = ""):
-        """Log verbose messages"""
+       
         if self.verbose:
             prefix = f"[{hostname}] " if hostname else ""
             self.logger.debug(f"{prefix}{message}")
             
     async def _test_smtp_connection(self, hostname: str, port: int = 25) -> Optional[socket.socket]:
-        """Test SMTP connection to host"""
+        
         try:
             # Create socket connection
             reader, writer = await asyncio.wait_for(
@@ -290,7 +290,7 @@ class SMTPScanner:
             return None
             
     async def _check_starttls_support(self, reader, writer, hostname: str) -> Tuple[bool, str]:
-        """Check if STARTTLS is supported"""
+        
         try:
             # Send EHLO
             response = await self._send_smtp_command(writer, reader, "EHLO example.com")
@@ -336,7 +336,7 @@ class SMTPScanner:
             return False, f"STARTTLS check error: {str(e)}"
             
     async def _test_tls_versions(self, hostname: str, port: int = 25) -> TLSConfig:
-        """Test TLS versions and ciphers for SMTP server"""
+        
         tls_config = TLSConfig()
         
         for ssl_version in [ssl.PROTOCOL_TLS_CLIENT] + self.WEAK_TLS_VERSIONS:
@@ -401,7 +401,7 @@ class SMTPScanner:
         return tls_config
         
     def _get_ssl_version_name(self, ssl_version: int) -> str:
-        """Get human-readable SSL version name"""
+        
         version_map = {
             ssl.PROTOCOL_TLS_CLIENT: "TLS",
             ssl.PROTOCOL_SSLv2: "SSLv2",
@@ -412,7 +412,7 @@ class SMTPScanner:
         return version_map.get(ssl_version, "Unknown")
         
     async def _check_vrfy_expn(self, reader, writer, hostname: str, usernames: List[str] = None) -> Tuple[bool, bool, List[str]]:
-        """Check if VRFY and EXPN commands are enabled and test usernames"""
+        """check vrfn and expn"""
         vrfy_enabled = False
         expn_enabled = False
         valid_users = []
@@ -450,7 +450,7 @@ class SMTPScanner:
         return vrfy_enabled, expn_enabled, valid_users
         
     async def _test_open_relay(self, reader, writer, hostname: str) -> Tuple[bool, List[Dict]]:
-        """Test if SMTP server is an open relay"""
+        """SMTP"""
         test_cases = [
             {
                 "from": "attacker@external.com",
@@ -519,7 +519,7 @@ class SMTPScanner:
     async def scan_smtp_vulnerabilities(self, mx_records: List[MXRecord], 
                                       usernames: List[str] = None,
                                       test_open_relay: bool = True) -> SMTPVulnerabilities:
-        """Scan SMTP server for vulnerabilities"""
+
         vulnerabilities = SMTPVulnerabilities()
         
         if not mx_records:
@@ -570,7 +570,7 @@ class SMTPScanner:
         return vulnerabilities
 
 class EmailSecurityScanner:
-    """Professional Email Security Scanner with comprehensive checks and DNS caching"""
+    
     
     # DNS resolvers for redundancy
     DNS_RESOLVERS = [
@@ -649,7 +649,7 @@ class EmailSecurityScanner:
             self.logger.debug(f"{prefix}{message}")
             
     async def _get_mx_records_dns(self, domain: str) -> List[MXRecord]:
-        """Get MX records using multiple DNS resolvers with caching"""
+        
         cache_key = f"mx:{domain}"
         
         # Check cache first
@@ -751,7 +751,7 @@ class EmailSecurityScanner:
         return result
         
     async def _get_txt_records(self, domain: str, record_type: str = "TXT") -> List[str]:
-        """Get TXT records using multiple DNS resolvers with caching"""
+        
         # Check cache first
         if self.dns_cache:
             cached_result = await self.dns_cache.get(domain, record_type)
@@ -1054,7 +1054,7 @@ class EmailSecurityScanner:
         return status, spf_record, message
         
     def _extract_dkim_key_info(self, dkim_record: str) -> Tuple[str, int]:
-        """Extract key type and length from DKIM record"""
+        """key type and lenght"""
         key_type = ""
         key_length = 0
         
@@ -1080,7 +1080,7 @@ class EmailSecurityScanner:
         return key_type.lower(), key_length
         
     async def _scan_dkim_records(self, domain: str, selectors: List[str]) -> Tuple[VulnerabilityStatus, List[DKIMRecord], str]:
-        """Scan DKIM records for vulnerabilities with caching"""
+        
         self._log_verbose(f"Scanning DKIM records with selectors: {', '.join(selectors)}", domain)
         
         dkim_records = []
@@ -1123,7 +1123,7 @@ class EmailSecurityScanner:
         return status, dkim_records, message
         
     async def _scan_dmarc_record(self, domain: str) -> Tuple[VulnerabilityStatus, Optional[DMARCRecord], str]:
-        """Scan DMARC record for vulnerabilities with caching"""
+        
         self._log_verbose(f"Scanning DMARC record", domain)
         
         dmarc_domain = f"_dmarc.{domain}"
@@ -1181,7 +1181,7 @@ class EmailSecurityScanner:
     async def _scan_smtp_vulnerabilities(self, domain: str, mx_records: List[MXRecord], 
                                        usernames: List[str] = None,
                                        test_open_relay: bool = True) -> Tuple[VulnerabilityStatus, Optional[SMTPVulnerabilities], str]:
-        """Scan SMTP server for vulnerabilities"""
+        
         self._log_verbose(f"Scanning SMTP vulnerabilities", domain)
         
         if not mx_records:
@@ -1230,7 +1230,7 @@ class EmailSecurityScanner:
                                 enable_smtp: bool, dkim_selectors: List[str],
                                 smtp_usernames: List[str] = None,
                                 test_open_relay: bool = True) -> EmailSecurityResult:
-        """Scan a single domain for email security vulnerabilities"""
+        
         start_time = time.time()
         domain = domain.strip().lower()
         
@@ -1322,7 +1322,7 @@ class EmailSecurityScanner:
                           enable_dmarc: bool = False, enable_smtp: bool = False,
                           dkim_selectors: List[str] = None, smtp_usernames: List[str] = None,
                           test_open_relay: bool = True, show_progress: bool = False) -> List[EmailSecurityResult]:
-        """Scan multiple domains concurrently"""
+        """scanning concurrently"""
         semaphore = asyncio.Semaphore(self.concurrency)
         
         if dkim_selectors is None:
@@ -1391,11 +1391,11 @@ class EmailSecurityScanner:
         return {"caching_disabled": True}
 
 class OutputManager:
-    """Handle various output formats"""
+    """various outputs"""
     
     @staticmethod
     def print_human_readable(results: List[EmailSecurityResult], verbose: bool = False, show_cache_stats: bool = False):
-        """Print results in human-readable format"""
+        
         print(f"\nEmail Security Scanner Results ({len(results)} domains scanned)")
         print("=" * 80)
         
@@ -1498,7 +1498,7 @@ class OutputManager:
     
     @staticmethod
     def _get_status_color(status: VulnerabilityStatus) -> str:
-        """Get ANSI color code for status"""
+        """ANSI color code """
         return {
             VulnerabilityStatus.VULNERABLE: "\033[91m",  # Red
             VulnerabilityStatus.WEAK: "\033[93m",        # Yellow
@@ -1510,7 +1510,7 @@ class OutputManager:
     
     @staticmethod
     def print_stdout_json(results: List[EmailSecurityResult]):
-        """Print raw JSON output to stdout for CI/CD"""
+        
         json_data = {
             "scan_timestamp": time.time(),
             "total_domains": len(results),
@@ -1528,7 +1528,7 @@ class OutputManager:
     
     @staticmethod
     def save_json(results: List[EmailSecurityResult], filename: str):
-        """Save results as JSON"""
+      
         json_data = {
             "scan_timestamp": time.time(),
             "total_domains": len(results),
@@ -1549,7 +1549,7 @@ class OutputManager:
     
     @staticmethod
     def save_csv(results: List[EmailSecurityResult], filename: str):
-        """Save results as CSV"""
+       
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow([
@@ -1577,7 +1577,7 @@ class OutputManager:
     
 
 def parse_domains_input(domain_input: str) -> List[str]:
-    """Parse domain input from various sources"""
+   
     domains = []
     
     # Check if input is a file
@@ -1601,7 +1601,7 @@ def parse_domains_input(domain_input: str) -> List[str]:
     return list(set(domains))
 
 async def main():
-    """Main function"""
+    
     parser = argparse.ArgumentParser(
         description="Professional Email Security Scanner with DNS Caching (MX, SPF, DKIM, DMARC, SMTP)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1850,3 +1850,4 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Fatal error: {str(e)}", file=sys.stderr)
         sys.exit(1)
+
