@@ -28,7 +28,7 @@ cd MailGuard
 pip install -r requirements.txt
 
 # Make executable (optional)
-chmod +x emailsec_scanner.py
+chmod +x mailguard.py
 ```
 
 ### Basic Usage
